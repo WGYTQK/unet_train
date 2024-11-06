@@ -15,26 +15,26 @@ from PIL import Image
 import cv2
 def width_height(path,crop):
     image_files = [f for f in os.listdir(path) if f.endswith(('.jpg', '.png'))]
-    # ���ͼƬ��������50�������ѡȡ50��ͼƬ������ѡ������ͼƬ
+    # 如果图片数量大于50，则随机选取50张图片，否则选择所有图片
     if len(image_files) > 50:
         image_files = random.sample(image_files, 50)
-    # ��ʼ�趨�ܿ�Ⱥ��ܳ���Ϊ0��ͼƬ����Ϊ0
+    # 初始设定总宽度和总长度为0，图片数量为0
     total_width = 0
     total_height = 0
     num_images = 0
-    # ��������ѡ�е�ͼƬ�ļ�
+    # 遍历所有选中的图片文件
     for image_file in image_files:
-        # ��ͼƬ
+        # 打开图片
         with Image.open(path + image_file) as img:
-            # ��ȡͼƬ��С
+            # 获取图片大小
             width, height = img.size
-            # ���ӵ��ܿ�Ⱥ��ܳ���
+            # 增加到总宽度和总长度
             total_width += width
             total_height += height
-            # ����ͼƬ����
+            # 增加图片数量
             num_images += 1
 
-    # ����ƽ����Ⱥ�ƽ������
+    # 计算平均宽度和平均长度
     average_width = total_width / num_images
     average_height = total_height / num_images
 
