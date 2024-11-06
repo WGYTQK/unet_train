@@ -15,26 +15,26 @@ from PIL import Image
 import cv2
 def width_height(path,crop):
     image_files = [f for f in os.listdir(path) if f.endswith(('.jpg', '.png'))]
-    # 如果图片数量大于50，则随机选取50张图片，否则选择所有图片
+    # ���ͼƬ��������50�������ѡȡ50��ͼƬ������ѡ������ͼƬ
     if len(image_files) > 50:
         image_files = random.sample(image_files, 50)
-    # 初始设定总宽度和总长度为0，图片数量为0
+    # ��ʼ�趨�ܿ�Ⱥ��ܳ���Ϊ0��ͼƬ����Ϊ0
     total_width = 0
     total_height = 0
     num_images = 0
-    # 遍历所有选中的图片文件
+    # ��������ѡ�е�ͼƬ�ļ�
     for image_file in image_files:
-        # 打开图片
+        # ��ͼƬ
         with Image.open(path + image_file) as img:
-            # 获取图片大小
+            # ��ȡͼƬ��С
             width, height = img.size
-            # 增加到总宽度和总长度
+            # ���ӵ��ܿ�Ⱥ��ܳ���
             total_width += width
             total_height += height
-            # 增加图片数量
+            # ����ͼƬ����
             num_images += 1
 
-    # 计算平均宽度和平均长度
+    # ����ƽ����Ⱥ�ƽ������
     average_width = total_width / num_images
     average_height = total_height / num_images
 
@@ -132,12 +132,12 @@ def train_on_device(args):
                 torch.save(model.state_dict(), os.path.join(args.model_savepath,  "model.pckl"))
                 n_iter = 0
                 precisions, recalls, f1s, aurocs = vail(model, args)
-                if aurocs >= best_auroc:
-                    preci = precisions
-                    recall = recalls
-                    f1 = f1s
-                    lun = epoch
-                    best_auroc = aurocs
+                preci = precisions
+                recall = recalls
+                f1 = f1s
+                lun = epoch
+                best_auroc = aurocs
+                pre_loss = Loss.item()
             else:
                 n_iter=n_iter+1
             if (epoch<100 and n_iter>=10) or (epoch>=100 and n_iter>=5) or (epoch == args.epochs-1):
@@ -149,13 +149,12 @@ def train_on_device(args):
             torch.save(model.state_dict(), os.path.join(args.model_savepath,  "model.pckl"))
             if epoch%3==0 and epoch>=0:
                 precisions, recalls, f1s, aurocs = vail(model,args)
-                if aurocs>=best_auroc:
-                    preci = precisions
-                    recall = recalls
-                    f1 = f1s
-                    lun = epoch
-                    best_auroc = aurocs
-        pre_loss = Loss.item()
+                preci = precisions
+                recall = recalls
+                f1 = f1s
+                lun = epoch
+                best_auroc = aurocs
+        
     params = {
         "precision":preci,
         "recall": recall,
@@ -177,7 +176,7 @@ if __name__=="__main__":
     parser.add_argument('--lr', action='store', type=float, default=0.0001, required=False, help="Learning rate")
     parser.add_argument('--epochs', action='store', type=int, default=300, required=False,
                         help="Number of epochs for training")
-
+    parser.add_argument("--input1", type=str, default="../image/image/", help="Component input port 1.")
     parser.add_argument("--image_path", type=str, default="../image/image/", help="Component input port 1.")
     parser.add_argument("--mask_path", type=str, default="../image/mask/", help="Component input port 2.")
     parser.add_argument("--model_savepath", type=str, default="../Mod/",
@@ -194,7 +193,19 @@ if __name__=="__main__":
     parser.add_argument("--need_cut", type=str, default="yes", help="yes/no")
     parser.add_argument("--complete_training", type=str, default="yes", help="yes/no")
 
+    parser.add_argument("--output1", type=str, default="/Mura_MMBR/code/output/output1/",
+                        help="Component output port 1.")
+    parser.add_argument("--output2", type=str, default="/Mura_MMBR/code/output/output2/",
+                        help="Component output port 2.")
+    parser.add_argument("--output3", type=str, default=None, help="Component output port 3.")
+    parser.add_argument("--output4", type=str, default=None, help="Component output port 4.")
+
     args = parser.parse_args()
+    
+    args.image_path = args.input1+'image/'
+    args.mask_path = args.input1+'mask/'
+    
+    args.model_savepath = os.path.dirname(args.output1.rstrip("/"))+"/"
     if args.need_cut == "yes":
         args.width,args.height =width_height(args.image_path,args.crop)
     else:
