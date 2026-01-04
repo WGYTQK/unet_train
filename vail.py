@@ -1,135 +1,192 @@
 import torch
 import os
 import numpy as np
-from sklearn.metrics import roc_auc_score,precision_score,recall_score,f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, jaccard_score
 import glob
 import cv2
 import itertools
-def generate_image(ndarr):
-    colors = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255],
-                       [255, 255, 255], [255, 255, 0], [0, 255, 255],
-                       [255, 0, 255]], dtype=np.uint8)  # 颜色数组
-    f, h, w = ndarr.shape
-    used_colors = np.array([colors[i % len(colors)] for i in range(f)])  # 确保颜色数量与图像数量相同
-    img_mask = np.where(ndarr > 0.5,1,0).astype(np.uint8)
-    color_img = np.zeros((h,w,3),np.uint8)
-    for i in range(1,f):
-        # 将单通道图像转换为三通道
-        img_3_channel = cv2.cvtColor(img_mask[i], cv2.COLOR_GRAY2BGR)
-        # 将图像的每个通道与颜色数组中的相应值相乘，这将为图像提供颜色
-        colored = img_3_channel * used_colors[i-1]
-        color_img = cv2.add(color_img, colored)
-    return color_img
+from typing import List, Tuple
+from tqdm import tqdm
+from sklearn.preprocessing import label_binarize
+from model_unetskip import AnomalySegmentationNetwork as CombinedNetwork, DepthwiseSeparableConv
 
-def reshape_tensors(tensors, rows, cols):
+def create_transparent_overlay(original: np.ndarray, pred_prob: np.ndarray) -> np.ndarray:
+    """
+    创建透明叠加效果，高亮显示预测目标区域
+    Args:
+        original: 原始BGR图像 (H, W, 3)
+        pred_prob: 预测概率图 (H, W)
+    Returns:
+        np.ndarray: 透明叠加效果图像
+    """
+    # 创建高亮区域（红色）
+    highlight = np.zeros_like(original)
+    pred_mask = (pred_prob > 0.5).astype(np.uint8)
+    highlight[pred_mask > 0] = [0, 0, 255]  # 红色高亮
+
+    # 创建透明叠加
+    overlay = original.copy()
+    alpha = 0.2  # 透明度
+    overlay = cv2.addWeighted(overlay, 1 - alpha, highlight, alpha, 0)
+
+    # 添加轮廓
+    contours, _ = cv2.findContours(pred_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 255, 255), 1)  # 黄色轮廓
+
+    return overlay
+
+
+# 将多个张量拼接成一个图像 (保持不变)
+def reshape_tensors(tensors: List[np.ndarray], rows: int, cols: int) -> np.ndarray:
     assert len(tensors) == rows * cols, 'Number of tensors does not fit the shape'
     lists = [[tensors[i * cols + j] for j in range(cols)] for i in range(rows)]
     row_tensors = [np.concatenate(lists[i], axis=-1) for i in range(rows)]
     image_tensor = np.concatenate(row_tensors, axis=-2)
     return image_tensor
-def caculate_metrics(target,pred):
-    pred1 = pred
-    pred1 = pred1.flatten()
-    pred = np.where(pred>0.5,1,0).astype(int)
-    target = np.where(target > 0.5, 1, 0).astype(int)
-    pred = pred.flatten()
-    target = target.flatten()
-    auroc = roc_auc_score(target, pred1)
-    if np.sum(pred)==0:
-        precision=0
+
+
+# 修改后的二分类指标计算函数
+def calculate_metrics(target: np.ndarray, pred_prob: np.ndarray,img_path) -> Tuple[float, float, float, float, float]:
+    """
+    单类别分割评估指标计算
+    Args:
+        target: 真实标签 (H,W)，值为0(背景)或1(目标)
+        pred_prob: 预测概率 (H,W)，值为[0,1]
+    Returns:
+        tuple: (precision, recall, f1, auroc, iou)
+    """
+    # 获取预测类别 (阈值为0.5)
+    pred_class = (pred_prob > 0.5).astype(np.uint8)
+
+    # 展平数组
+    target_flat = target.flatten()
+    pred_class_flat = pred_class.flatten()
+    pred_prob_flat = pred_prob.flatten()
+
+    # 计算Precision、Recall、F1
+    precision = precision_score(target_flat, pred_class_flat, zero_division=1)
+    recall = recall_score(target_flat, pred_class_flat, zero_division=1)
+    f1 = f1_score(target_flat, pred_class_flat, zero_division=1)
+
+    # 计算AUROC (需要正负样本都存在)
+    if np.unique(target_flat).size > 1:
+        try:
+            auroc = roc_auc_score(target_flat, pred_prob_flat)
+        except:
+            auroc = 0.5
+            print(img_path)
     else:
-        precision = precision_score(target, pred,zero_division=1)
-    recall = recall_score(target, pred)
-    f1 = f1_score(target, pred)
+        auroc = 0.5  # 只有单一类别时设为0.5
 
-    return precision, recall, f1, auroc
+    # 计算IoU (Jaccard指数)
+    iou = jaccard_score(target_flat, pred_class_flat, zero_division=1)
 
-def vail(model,args):
-    precisions, recalls, f1s, aurocs = [], [], [], []
-    all_image_paths = sorted(glob.glob(args.image_path + "/*.jpg"))
-    all_mask_paths = []
-    anomaly_image_paths = []
-    mask_image_path = args.mask_path
-    labels = args.labels.split(',')
-    for label in labels:
-        rot_dir = mask_image_path + label + "/"
-        all_mask_paths += sorted(glob.glob(rot_dir + "/*.png"))
-    filenames = [os.path.splitext(os.path.split(path)[1])[0] for path in all_mask_paths]
-    for filename in filenames:
-        new_path = os.path.join(args.image_path, filename + ".jpg")
-        anomaly_image_paths.append(new_path)
-    anomaly_image_paths = list(set(anomaly_image_paths))
-    cutoff = int(0.95 * len(all_image_paths))
-    cutoff1 = int(0.3 * len(anomaly_image_paths))
-    image_paths = list(set(all_image_paths[cutoff:] + anomaly_image_paths[:cutoff1]))
+    return precision, recall, f1, auroc, iou
 
-    for file_path in image_paths:
-        image = cv2.imread(file_path)
-        image = cv2.resize(image, (args.width, args.height))
-        fname = os.path.basename(file_path)
-        fname, _ = os.path.splitext(fname)
-        labels = args.labels.split(',')
-        masks = []
-        mask = np.ones(image.shape, dtype=np.uint8) * 255
-        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        masks.append(mask)
-        for label in labels:
-            path = os.path.join(args.mask_path, label, fname + '.png')
-            if os.path.exists(path):
-                mask = cv2.imread(path)
-                mask = cv2.resize(mask, (args.width, args.height))
+
+# 修改后的验证函数
+def validate_model(model: torch.nn.Module, args) -> Tuple[float, float, float, float, float]:
+    model.eval()
+    device = next(model.parameters()).device
+
+    # 获取所有测试图像路径
+    val_paths = sorted(glob.glob(f"{args.val_path}/*.png") +
+                         glob.glob(f"{args.val_path}/*.jpg"))
+
+    val_paths = val_paths[:int(len(val_paths)*0.4)]
+    metrics = {
+        'precision': [],
+        'recall': [],
+        'f1': [],
+        'auroc': [],
+        'iou': []
+    }
+    num_name = 0
+    with torch.no_grad():
+        for img_path in tqdm(val_paths, desc="Validating"):
+            # 1. 加载并预处理图像
+            image = cv2.imread(img_path)
+            img_yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+            # 分离通道
+            y, cr, cb = cv2.split(img_yuv)
+            # 只对亮度通道进行均衡化
+            y_eq = cv2.equalizeHist(y)
+            # 合并通道
+            img_yuv_eq = cv2.merge((y_eq, cr, cb))
+            # 转换回BGR颜色空间
+            image = cv2.cvtColor(img_yuv_eq, cv2.COLOR_YCrCb2BGR)
+            image = cv2.resize(image, (args.height, args.height))
+            image_tensor = torch.from_numpy(image).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+
+            # 2. 生成灰度图像 (如果模型需要)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray_tensor = torch.from_numpy(gray).float().unsqueeze(0).unsqueeze(0) / 255.0
+
+            # 3. 加载真实标签
+            fname = os.path.splitext(os.path.basename(img_path))[0]
+            gt_path = f"{args.anomaly_source_path}/{fname}.png"
+            if os.path.exists(gt_path):
+                gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
+
+
+                # gt = np.where(gt > 0, 0, 255).astype(np.uint8)  # 确保输出是 uint8
+
+                gt = cv2.resize(gt, (args.height, args.height))
+                gt = (gt > 0).astype(np.uint8)  # 将标签二值化为0或1
             else:
-                mask = np.zeros(image.shape, dtype=np.uint8)
-            mask[mask > 0] = 255
-            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-            masks.append(mask)
-            masks[0][mask > 0] = 0
-        gt = np.dstack(masks)
-
-        gt = cv2.resize(gt, (args.width, args.height))
-        out_masks = []
-        gray_recs = []
-        anomaly_masks = []
-        crop_h, crop_w = args.crop, args.crop
-        h, w, _ = image.shape
-        for m, n in itertools.product(range(0, h, crop_h), range(0, w, crop_w)):
-            image_seg = image[m:m + crop_h, n:n + crop_w]
-            anomaly_mask_seg = gt[m:m + crop_h, n:n + crop_w]
-            image_seg = cv2.resize(image_seg, (args.resize, args.resize))
-            image_seg = np.array(image_seg).reshape((image_seg.shape[0], image_seg.shape[1], image_seg.shape[2])).astype(np.float32) / 255.0
-            anomaly_mask_seg = cv2.resize(anomaly_mask_seg, (args.resize, args.resize))
-            anomaly_mask_seg = np.array(anomaly_mask_seg).astype(np.float32) / 255.0
-            auggray = cv2.cvtColor(image_seg, cv2.COLOR_BGR2GRAY)
-            auggray = auggray[:, :, None]
-            image_seg = np.transpose(image_seg, (2, 0, 1))
-            auggray = np.transpose(auggray, (2, 0, 1))
-            anomaly_mask_seg = np.transpose(anomaly_mask_seg, (2, 0, 1))
-            gray_rec, out_mask = model(torch.from_numpy(np.expand_dims(image_seg,axis=0)).cuda())
-            out_masks.append(out_mask.detach().cpu().numpy()[0, :, :, :])
-            gray_recs.append(gray_rec.detach().cpu().numpy()[0, :, :, :])
-            anomaly_masks.append(anomaly_mask_seg)
-
-        true_mask_cv = reshape_tensors(anomaly_masks, h // crop_h, w // crop_w)
-        out_mask = reshape_tensors(out_masks,h//crop_h,w//crop_w)
-
-        out_mask_sm = torch.softmax(torch.tensor(out_mask), dim=0)
-        out_mask_cv = out_mask_sm.detach().cpu().numpy()
+                gt = np.zeros((args.height, args.height), dtype=np.uint8)  # 全背景
 
 
-        precision, recall, f1, auroc = caculate_metrics(true_mask_cv, out_mask_cv)
-        precisions.append(precision)
-        recalls.append(recall)
-        f1s.append(f1)
-        aurocs.append(auroc)
-        out_mask_cv = generate_image(out_mask_cv)
-        cv2.imwrite("./test.jpg",out_mask_cv)
+            _, out_mask = model(
+                image_tensor.to(device),
+                gray_tensor.to(device)
+            )
 
-    precision = np.average(precisions)
-    recall = np.average(recalls)
-    f1 = np.average(f1s)
-    auroc = np.average(aurocs)
-    print(f"precision:{precision} recall:{recall} f1:{f1} auroc{auroc}")
-    return precision, recall, f1,auroc
+            # 5. 处理模型输出 (单通道)
+            if out_mask.shape[1] > 1:  # 如果输出多通道，取第一个通道
+                pred_prob = out_mask[:, 1, :, :].squeeze().cpu().numpy()
+            else:
+                pred_prob = out_mask.squeeze().cpu().numpy()  # (H,W)
 
+            # 6. 计算指标
+            precision, recall, f1, auroc, iou = calculate_metrics(gt, pred_prob,img_path)
 
+            # 存储结果
+            metrics['precision'].append(precision)
+            metrics['recall'].append(recall)
+            metrics['f1'].append(f1)
+            metrics['auroc'].append(auroc)
+            metrics['iou'].append(iou)
+            num_name = num_name+1
+            # 7. 可视化保存 (可选)
+            if args.save_visualization:
+                # 创建可视化目录
+                vis_dir = os.path.join(args.output_dir, "visualization")
+                os.makedirs(vis_dir, exist_ok=True)
 
+                # # 1. 创建热力图叠加效果
+                # heatmap = create_heatmap_overlay(image, pred_prob)
+                # cv2.imwrite(os.path.join(vis_dir, f"heatmap_{fname}.jpg"), heatmap)
+                #
+                # # 2. 创建并排对比图（原图 + 分割结果）
+                # comparison = create_comparison_image(image, gt, pred_prob)
+                # cv2.imwrite(os.path.join(vis_dir, f"comparison_{fname}.jpg"), comparison)
+
+                # 3. 创建透明叠加效果
+                overlay = create_transparent_overlay(image, pred_prob)
+                cv2.imwrite(os.path.join(vis_dir, f"overlay_{num_name}.jpg"), overlay)
+
+                # # 4. 保存原始预测概率图（用于进一步分析）
+                # pred_prob_scaled = (pred_prob * 255).astype(np.uint8)
+                # cv2.imwrite(os.path.join(vis_dir, f"prob_{num_name}.png"), pred_prob_scaled)
+
+    # 计算平均指标
+    avg_metrics = {k: np.mean(v) for k, v in metrics.items()}
+    print(f"Validation Results - "
+          f"Precision: {avg_metrics['precision']:.4f}, "
+          f"Recall: {avg_metrics['recall']:.4f}, "
+          f"F1: {avg_metrics['f1']:.4f}, "
+          f"AUROC: {avg_metrics['auroc']:.4f}, "
+          f"IoU: {avg_metrics['iou']:.4f}")
+
+    return avg_metrics['precision'],avg_metrics['recall'],avg_metrics['f1'],avg_metrics['auroc'],avg_metrics['iou']
