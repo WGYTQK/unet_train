@@ -3,44 +3,63 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from math import exp
-#criterion = MultiClassFocalLoss(gamma=2, alpha=[1,1,1,1,1], size_average=True)
+
+
 class MultiClassFocalLoss(nn.Module):
-    def __init__(self, gamma=2, alpha=None, size_average=True):
-        super(MultiClassFocalLoss, self).__init__()
-        self.gamma = gamma
+    def __init__(self, alpha=None, gamma=1.0, reduction='mean'):
+        """
+        alpha: 类别权重张量 (形状 [num_classes])
+        gamma: 难易样本调节因子
+        reduction: 损失聚合方式 ('mean', 'sum' 或 'none')
+        """
+        super().__init__()
         self.alpha = alpha
-        if isinstance(alpha,(float,int)): 
-            self.alpha = torch.Tensor([alpha,1-alpha])
-        if isinstance(alpha,list): 
-            self.alpha = torch.Tensor(alpha)
-        self.size_average = size_average
+        self.gamma = gamma
+        self.reduction = reduction
 
-    def forward(self, input, target):
-        target = target.argmax(dim=1)
-        if input.dim()>2:
-            input = input.view(input.size(0),input.size(1),-1)  # N,C,H,W => N,C,H*W
-            input = input.transpose(1,2)    # N,C,H*W => N,H*W,C
-            input = input.contiguous().view(-1,input.size(2))   # N,H*W,C => N*H*W,C
-        target = target.view(-1,1)
+    def forward(self, inputs, targets):
+        # 输入校验
+        assert inputs.dim() == 4, "Input must be 4D: (batch, channels, H, W)"
+        assert targets.dim() == 4, "Target must be 4D: (batch, channels, H, W)"
 
-        logpt = F.log_softmax(input,dim=1)
-        logpt = logpt.gather(1,target)
-        logpt = logpt.view(-1)
-        pt = logpt.data.exp()
+        # 转换为分类任务标准格式
+        batch_size, num_classes, H, W = inputs.shape
+        inputs = inputs.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+        inputs = inputs.view(-1, num_classes)  # [B*H*W, C]
+        targets = targets.permute(0, 2, 3, 1).contiguous()  # [B, H, W, C]
+        targets = targets.view(-1, num_classes)  # [B*H*W, C]
 
+        # 计算 softmax 概率
+        probs = F.softmax(inputs, dim=1)  # 概率归一化
+
+        # 提取真实类别对应的概率
+        true_class_probs = torch.sum(probs * targets, dim=1)  # [B*H*W]
+
+        # 避免数值不稳定（log(0)）
+        epsilon = 1e-7
+        true_class_probs = torch.clamp(true_class_probs, min=epsilon, max=1 - epsilon)
+
+        # 计算交叉熵基础项
+        log_probs = -torch.log(true_class_probs)  # 标准交叉熵
+
+        # Focal Loss 调节因子
+        focal_weights = (1 - true_class_probs) ** self.gamma
+
+        # 应用类别权重
         if self.alpha is not None:
-            if self.alpha.type()!=input.data.type():
-                self.alpha = self.alpha.type_as(input.data)
-            at = self.alpha.gather(0,target.data.view(-1))
-            logpt = logpt * at
+            alpha_weights = torch.sum(targets * self.alpha, dim=1)  # 按类别提取权重
+            focal_weights = alpha_weights * focal_weights
 
-        loss = -1 * (1-pt)**self.gamma * logpt
-        if self.size_average: 
+        # 计算最终损失
+        loss = focal_weights * log_probs
+
+        # 聚合损失
+        if self.reduction == 'mean':
             return loss.mean()
-        else: 
+        elif self.reduction == 'sum':
             return loss.sum()
-
-
+        else:
+            return loss
 class FocalLoss(nn.Module):
     """
     copy from: https://github.com/Hsuxu/Loss_ToolBox-PyTorch/blob/master/FocalLoss/FocalLoss.py
@@ -78,7 +97,6 @@ class FocalLoss(nn.Module):
             logit = logit.view(logit.size(0), logit.size(1), -1)
             logit = logit.permute(0, 2, 1).contiguous()
             logit = logit.view(-1, logit.size(-1))
-
         target = torch.squeeze(target, 1)
         target = target.view(-1, 1)
         alpha = self.alpha
