@@ -3,7 +3,309 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from math import exp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
+
+class HierarchicalLoss(nn.Module):
+    """分层损失函数，用于级联分割网络"""
+
+    def __init__(self, primary_weight=0.3, refine_weight=0.7):
+        super().__init__()
+        self.primary_weight = primary_weight
+        self.refine_weight = refine_weight
+
+        # 初级损失组件
+        self.primary_loss = nn.BCEWithLogitsLoss()
+
+        # 精细损失组件（更严格）
+        self.refine_bce = nn.BCEWithLogitsLoss()
+        self.refine_dice = DiceLoss()
+        self.refine_boundary = BoundaryAwareLoss()
+
+    def forward(self, primary_pred, refine_pred, target):
+        # 初级分割损失
+        primary_loss = self.primary_loss(primary_pred[:, 1:2, :, :], target)
+
+        # 精细分割损失（组合多个损失）
+        refine_bce_loss = self.refine_bce(refine_pred[:, 1:2, :, :], target)
+        refine_dice_loss = self.refine_dice(refine_pred[:, 1:2, :, :], target)
+        refine_boundary_loss = self.refine_boundary(refine_pred[:, 1:2, :, :], target)
+
+        refine_loss = refine_bce_loss + refine_dice_loss + 0.5 * refine_boundary_loss
+
+        # 总损失
+        total_loss = self.primary_weight * primary_loss + self.refine_weight * refine_loss
+
+        return {
+            'total': total_loss,
+            'primary': primary_loss,
+            'refine_bce': refine_bce_loss,
+            'refine_dice': refine_dice_loss,
+            'refine_boundary': refine_boundary_loss
+        }
+
+
+class AdaptiveSizeAwareLoss(nn.Module):
+    """自适应大小感知损失"""
+
+    def __init__(self):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.dice = DiceLoss()
+
+    def compute_target_statistics(self, target):
+        """计算目标统计信息"""
+        batch_size = target.shape[0]
+        stats = []
+
+        for i in range(batch_size):
+            target_i = target[i:i + 1]
+            area = torch.sum(target_i > 0.5).float()
+            total_pixels = target_i.numel()
+            area_ratio = area / total_pixels
+
+            # 计算紧凑度（周长/面积）
+            contours = self.get_contours(target_i[0, 0].detach().cpu().numpy())
+            if contours:
+                perimeter = sum([cv2.arcLength(cnt, True) for cnt in contours])
+                compactness = perimeter / (torch.sqrt(area) + 1e-8)
+            else:
+                compactness = torch.tensor(0.0)
+
+            stats.append({
+                'area_ratio': area_ratio.item(),
+                'compactness': compactness.item(),
+                'is_small': area_ratio < 0.01,
+                'is_large': area_ratio > 0.3,
+                'is_scattered': len(contours) > 10
+            })
+
+        return stats
+
+    def forward(self, pred, target):
+        target_stats = self.compute_target_statistics(target)
+        batch_size = pred.shape[0]
+
+        total_loss = 0
+        for i in range(batch_size):
+            pred_i = pred[i:i + 1]
+            target_i = target[i:i + 1]
+            stats = target_stats[i]
+
+            # 根据目标特性调整损失
+            if stats['is_small']:
+                # 小目标：使用Dice损失，对类别不平衡更友好
+                loss = self.dice(pred_i, target_i) * 1.5
+            elif stats['is_large']:
+                # 大目标：使用BCE + 边界约束
+                bce_loss = self.bce(pred_i, target_i).mean()
+                loss = bce_loss * 0.7 + self.dice(pred_i, target_i) * 0.3
+            elif stats['is_scattered']:
+                # 分散目标：强调每个单独目标
+                loss = self.dice(pred_i, target_i) * 2.0
+            else:
+                # 正常目标：平衡损失
+                loss = self.bce(pred_i, target_i).mean() + self.dice(pred_i, target_i)
+
+            total_loss += loss
+
+        return total_loss / batch_size
+
+
+class ConsistencyLoss(nn.Module):
+    """一致性损失，确保两个分割网络的结果一致"""
+
+    def __init__(self, mode='kl'):
+        super().__init__()
+        self.mode = mode
+
+    def forward(self, primary_pred, refine_pred):
+        primary_prob = torch.softmax(primary_pred, dim=1)[:, 1:2, :, :]
+        refine_prob = torch.softmax(refine_pred, dim=1)[:, 1:2, :, :]
+
+        if self.mode == 'kl':
+            # KL散度
+            loss = F.kl_div(
+                torch.log(primary_prob + 1e-8),
+                refine_prob,
+                reduction='batchmean'
+            )
+        elif self.mode == 'mse':
+            # MSE
+            loss = F.mse_loss(primary_prob, refine_prob)
+        elif self.mode == 'correlation':
+            # 相关性损失
+            batch_size = primary_prob.shape[0]
+            corr_loss = 0
+            for i in range(batch_size):
+                p = primary_prob[i].flatten()
+                r = refine_prob[i].flatten()
+                correlation = torch.corrcoef(torch.stack([p, r]))[0, 1]
+                corr_loss += 1 - correlation
+            loss = corr_loss / batch_size
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+        return loss
+
+
+class ProgressiveLearningLoss(nn.Module):
+    """渐进学习损失，随着训练进程调整损失权重"""
+
+    def __init__(self, total_epochs=1000):
+        super().__init__()
+        self.total_epochs = total_epochs
+        self.current_epoch = 0
+
+        # 不同阶段的损失权重
+        self.stage1_weights = {'primary': 0.5, 'refine': 0.3, 'consistency': 0.2}
+        self.stage2_weights = {'primary': 0.3, 'refine': 0.5, 'consistency': 0.2}
+        self.stage3_weights = {'primary': 0.2, 'refine': 0.6, 'consistency': 0.2}
+
+        # 损失组件
+        self.primary_loss = AdaptiveSizeAwareLoss()
+        self.refine_loss = AdaptiveSizeAwareLoss()
+        self.consistency_loss = ConsistencyLoss(mode='kl')
+
+    def set_epoch(self, epoch):
+        self.current_epoch = epoch
+
+    def get_current_weights(self):
+        """根据训练阶段调整权重"""
+        progress = self.current_epoch / self.total_epochs
+
+        if progress < 0.3:
+            return self.stage1_weights  # 早期：关注初级分割
+        elif progress < 0.7:
+            return self.stage2_weights  # 中期：平衡关注
+        else:
+            return self.stage3_weights  # 后期：关注精细分割
+
+    def forward(self, primary_pred, refine_pred, target):
+        weights = self.get_current_weights()
+
+        # 计算各个损失
+        loss_primary = self.primary_loss(primary_pred[:, 1:2, :, :], target)
+        loss_refine = self.refine_loss(refine_pred[:, 1:2, :, :], target)
+        loss_consistency = self.consistency_loss(primary_pred, refine_pred)
+
+        # 加权总损失
+        total_loss = (
+                weights['primary'] * loss_primary +
+                weights['refine'] * loss_refine +
+                weights['consistency'] * loss_consistency
+        )
+
+        return {
+            'total': total_loss,
+            'primary': loss_primary,
+            'refine': loss_refine,
+            'consistency': loss_consistency,
+            'weights': weights
+        }
+
+
+class FocalDiceLoss(nn.Module):
+    """Focal Dice Loss，结合了Focal Loss和Dice Loss的优点"""
+
+    def __init__(self, gamma=2.0, alpha=0.25, smooth=1e-5):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        # 计算概率
+        pred_prob = torch.sigmoid(pred)
+
+        # Dice损失部分
+        intersection = torch.sum(pred_prob * target)
+        union = torch.sum(pred_prob) + torch.sum(target)
+        dice_loss = 1 - (2. * intersection + self.smooth) / (union + self.smooth)
+
+        # Focal损失部分
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
+        focal_loss = focal_loss.mean()
+
+        # 组合损失
+        combined_loss = dice_loss + focal_loss
+
+        return combined_loss
+
+
+class BoundaryAwareLoss(nn.Module):
+    """改进的边界感知损失"""
+
+    def __init__(self, alpha=0.5, beta=0.3):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+
+    def get_boundary_mask(self, mask, kernel_sizes=[3, 5]):
+        """生成多尺度边界掩码"""
+        device = mask.device
+        boundary_mask = torch.zeros_like(mask)
+
+        for k_size in kernel_sizes:
+            padding = k_size // 2
+            kernel = torch.ones(1, 1, k_size, k_size).to(device)
+
+            dilated = F.conv2d(mask.float(), kernel, padding=padding) > 0
+            eroded = F.conv2d(mask.float(), kernel, padding=padding) < (k_size * k_size)
+            boundary = (dilated.float() - eroded.float()).clamp(0, 1)
+
+            # 根据边界宽度调整权重
+            weight = 1.0 + self.alpha * (k_size / 3.0) * boundary
+            boundary_mask = torch.max(boundary_mask, weight)
+
+        return boundary_mask
+
+    def forward(self, pred, target):
+        # 边界权重
+        boundary_weight = self.get_boundary_mask(target)
+
+        # 加权BCE损失
+        bce_loss = self.bce(pred, target)
+        weighted_bce = (bce_loss * boundary_weight).mean()
+
+        # 连续性约束
+        pred_prob = torch.sigmoid(pred)
+
+        # 水平连续性
+        diff_h = torch.abs(pred_prob[:, :, 1:, :] - pred_prob[:, :, :-1, :])
+        # 垂直连续性
+        diff_v = torch.abs(pred_prob[:, :, :, 1:] - pred_prob[:, :, :, :-1])
+
+        continuity_loss = diff_h.mean() + diff_v.mean()
+
+        # 总损失
+        total_loss = weighted_bce + self.beta * continuity_loss
+
+        return total_loss
+
+
+class DiceLoss(nn.Module):
+    """Dice损失"""
+
+    def __init__(self, smooth=1e-5):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred_prob = torch.sigmoid(pred)
+
+        intersection = torch.sum(pred_prob * target)
+        union = torch.sum(pred_prob) + torch.sum(target)
+
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+
+        return 1 - dice
 
 class MultiClassFocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=1.0, reduction='mean'):
@@ -60,6 +362,8 @@ class MultiClassFocalLoss(nn.Module):
             return loss.sum()
         else:
             return loss
+
+
 class FocalLoss(nn.Module):
     """
     copy from: https://github.com/Hsuxu/Loss_ToolBox-PyTorch/blob/master/FocalLoss/FocalLoss.py
@@ -141,15 +445,18 @@ class FocalLoss(nn.Module):
             loss = loss.mean()
         return loss
 
+
 def gaussian(window_size, sigma):
-    gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-    return gauss/gauss.sum()
+    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
+    return gauss / gauss.sum()
+
 
 def create_window(window_size, channel=1):
     _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
     _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
     return window
+
 
 def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):
     if val_range is None:
@@ -166,7 +473,7 @@ def ssim(img1, img2, window_size=11, window=None, size_average=True, full=False,
     else:
         l = val_range
 
-    padd = window_size//2
+    padd = window_size // 2
     (_, channel, height, width) = img1.size()
     if window is None:
         real_size = min(window_size, height, width)
@@ -213,7 +520,7 @@ class SSIM(torch.nn.Module):
         self.channel = 1
         self.window = create_window(window_size).cuda()
 
-    def forward(self, img1, img2,asloss=True):
+    def forward(self, img1, img2, asloss=True):
         (_, channel, _, _) = img1.size()
 
         if channel == self.channel and self.window.dtype == img1.dtype:
@@ -223,14 +530,12 @@ class SSIM(torch.nn.Module):
             self.window = window
             self.channel = channel
 
-        s_score, ssim_map = ssim(img1, img2, window=window, window_size=self.window_size, size_average=self.size_average)
+        s_score, ssim_map = ssim(img1, img2, window=window, window_size=self.window_size,
+                                 size_average=self.size_average)
         if asloss:
             return 1.0 - s_score
         else:
             return 1.0 - ssim_map
-
-
-
 
 
 class ContrastiveLoss(torch.nn.Module):
@@ -244,130 +549,129 @@ class ContrastiveLoss(torch.nn.Module):
                                       y * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
         return loss_contrastive
 
-#ssim.py
+
+# ssim.py
 import numpy as np
 import scipy.signal
 
 
-def ssim_index_new(img1,img2,K,win):
-
-    M,N = img1.shape
+def ssim_index_new(img1, img2, K, win):
+    M, N = img1.shape
 
     img1 = img1.astype(np.float32)
     img2 = img2.astype(np.float32)
 
-    C1 = (K[0]*255)**2
-    C2 = (K[1]*255) ** 2
-    win = win/np.sum(win)
+    C1 = (K[0] * 255) ** 2
+    C2 = (K[1] * 255) ** 2
+    win = win / np.sum(win)
 
-    mu1 = scipy.signal.convolve2d(img1,win,mode='valid')
-    mu2 = scipy.signal.convolve2d(img2,win,mode='valid')
-    mu1_sq = np.multiply(mu1,mu1)
-    mu2_sq = np.multiply(mu2,mu2)
-    mu1_mu2 = np.multiply(mu1,mu2)
-    sigma1_sq = scipy.signal.convolve2d(np.multiply(img1,img1),win,mode='valid') - mu1_sq
+    mu1 = scipy.signal.convolve2d(img1, win, mode='valid')
+    mu2 = scipy.signal.convolve2d(img2, win, mode='valid')
+    mu1_sq = np.multiply(mu1, mu1)
+    mu2_sq = np.multiply(mu2, mu2)
+    mu1_mu2 = np.multiply(mu1, mu2)
+    sigma1_sq = scipy.signal.convolve2d(np.multiply(img1, img1), win, mode='valid') - mu1_sq
     sigma2_sq = scipy.signal.convolve2d(np.multiply(img2, img2), win, mode='valid') - mu2_sq
     img12 = np.multiply(img1, img2)
     sigma12 = scipy.signal.convolve2d(np.multiply(img1, img2), win, mode='valid') - mu1_mu2
 
-    if(C1 > 0 and C2>0):
-        ssim1 =2*sigma12 + C2
-        ssim_map = np.divide(np.multiply((2*mu1_mu2 + C1),(2*sigma12 + C2)),np.multiply((mu1_sq+mu2_sq+C1),(sigma1_sq+sigma2_sq+C2)))
-        cs_map = np.divide((2*sigma12 + C2),(sigma1_sq + sigma2_sq + C2))
+    if (C1 > 0 and C2 > 0):
+        ssim1 = 2 * sigma12 + C2
+        ssim_map = np.divide(np.multiply((2 * mu1_mu2 + C1), (2 * sigma12 + C2)),
+                             np.multiply((mu1_sq + mu2_sq + C1), (sigma1_sq + sigma2_sq + C2)))
+        cs_map = np.divide((2 * sigma12 + C2), (sigma1_sq + sigma2_sq + C2))
     else:
-        numerator1 = 2*mu1_mu2 + C1
-        numerator2 = 2*sigma12 + C2
-        denominator1 = mu1_sq + mu2_sq +C1
-        denominator2 = sigma1_sq + sigma2_sq +C2
+        numerator1 = 2 * mu1_mu2 + C1
+        numerator2 = 2 * sigma12 + C2
+        denominator1 = mu1_sq + mu2_sq + C1
+        denominator2 = sigma1_sq + sigma2_sq + C2
 
         ssim_map = np.ones(mu1.shape)
-        index = np.multiply(denominator1,denominator2)
-        #如果index是真，就赋值，是假就原值
-        n,m = mu1.shape
+        index = np.multiply(denominator1, denominator2)
+        # 如果index是真，就赋值，是假就原值
+        n, m = mu1.shape
         for i in range(n):
             for j in range(m):
-                if(index[i][j] > 0):
-                    ssim_map[i][j] = numerator1[i][j]*numerator2[i][j]/denominator1[i][j]*denominator2[i][j]
+                if (index[i][j] > 0):
+                    ssim_map[i][j] = numerator1[i][j] * numerator2[i][j] / denominator1[i][j] * denominator2[i][j]
                 else:
                     ssim_map[i][j] = ssim_map[i][j]
         for i in range(n):
             for j in range(m):
-                if((denominator1[i][j] != 0)and(denominator2[i][j] == 0)):
-                    ssim_map[i][j] = numerator1[i][j]/denominator1[i][j]
+                if ((denominator1[i][j] != 0) and (denominator2[i][j] == 0)):
+                    ssim_map[i][j] = numerator1[i][j] / denominator1[i][j]
                 else:
                     ssim_map[i][j] = ssim_map[i][j]
 
         cs_map = np.ones(mu1.shape)
         for i in range(n):
             for j in range(m):
-                if(denominator2[i][j] > 0):
-                    cs_map[i][j] = numerator2[i][j]/denominator2[i][j]
+                if (denominator2[i][j] > 0):
+                    cs_map[i][j] = numerator2[i][j] / denominator2[i][j]
                 else:
                     cs_map[i][j] = cs_map[i][j]
-
 
     mssim = np.mean(ssim_map)
     mcs = np.mean(cs_map)
 
-    return  mssim,mcs
+    return mssim, mcs
 
 
-#msssim.py
+# msssim.py
 import numpy as np
 import cv2
 
 
-def msssim(img1,img2):
-
-    K = [0.01,0.03]
-    win  = np.multiply(cv2.getGaussianKernel(11, 1.5), (cv2.getGaussianKernel(11, 1.5)).T)  # H.shape == (r, c)
+def msssim(img1, img2):
+    K = [0.01, 0.03]
+    win = np.multiply(cv2.getGaussianKernel(11, 1.5), (cv2.getGaussianKernel(11, 1.5)).T)  # H.shape == (r, c)
     level = 5
-    weight = [0.0448,0.2856,0.3001,0.2363,0.1333]
+    weight = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
     method = 'product'
 
-    #M,N = img1.shape
-    #H,W = win.shape
+    # M,N = img1.shape
+    # H,W = win.shape
 
-    downsample_filter = np.ones((2,2))/4
-    #img1 = img1.astype(np.float32)
-    #img2 = img2.astype(np.float32)
-    img1= img1.cpu().numpy()
+    downsample_filter = np.ones((2, 2)) / 4
+    # img1 = img1.astype(np.float32)
+    # img2 = img2.astype(np.float32)
+    img1 = img1.cpu().numpy()
     img2 = img2.cpu().numpy()
 
     mssim_array = []
     mcs_array = []
 
-    for i in range(0,level):
-        mssim,mcs = ssim_index_new(img1,img2,K,win)
+    for i in range(0, level):
+        mssim, mcs = ssim_index_new(img1, img2, K, win)
         mssim_array.append(mssim)
         mcs_array.append(mcs)
-        filtered_im1 = cv2.filter2D(img1,-1,downsample_filter,anchor = (0,0),borderType=cv2.BORDER_REFLECT)
-        filtered_im2 = cv2.filter2D(img2,-1,downsample_filter,anchor = (0,0),borderType=cv2.BORDER_REFLECT)
-        img1 = filtered_im1[::2,::2]
-        img2 = filtered_im2[::2,::2]
+        filtered_im1 = cv2.filter2D(img1, -1, downsample_filter, anchor=(0, 0), borderType=cv2.BORDER_REFLECT)
+        filtered_im2 = cv2.filter2D(img2, -1, downsample_filter, anchor=(0, 0), borderType=cv2.BORDER_REFLECT)
+        img1 = filtered_im1[::2, ::2]
+        img2 = filtered_im2[::2, ::2]
 
-    print(np.power(mcs_array[:level-1],weight[:level-1]))
-    print(mssim_array[level-1]**weight[level-1])
-    overall_mssim = np.prod(np.power(mcs_array[:level-1],weight[:level-1]))*(mssim_array[level-1]**weight[level-1])
+    print(np.power(mcs_array[:level - 1], weight[:level - 1]))
+    print(mssim_array[level - 1] ** weight[level - 1])
+    overall_mssim = np.prod(np.power(mcs_array[:level - 1], weight[:level - 1])) * (
+                mssim_array[level - 1] ** weight[level - 1])
 
     return overall_mssim
-
 
 
 class SoftDiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
         super(SoftDiceLoss, self).__init__()
- 
+
     def forward(self, logits, targets):
         num = targets.size(0)
-      
+
         smooth = 1
-        
+
         probs = torch.sigmoid(logits)
         m1 = probs.view(num, -1)
         m2 = targets.view(num, -1)
         intersection = (m1 * m2)
- 
+
         score = 2. * (intersection.sum(1) + smooth) / (m1.sum(1) + m2.sum(1) + smooth)
         score = 1 - score.sum() / num
         return score
